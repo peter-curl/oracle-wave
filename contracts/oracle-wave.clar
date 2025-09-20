@@ -174,3 +174,151 @@
         (ok true)
     )
 )
+
+;; Market Resolution Function  
+;; Oracle-driven market settlement with final BTC price
+(define-public (resolve-prediction-market (market-id uint) (final-btc-price uint))
+    (let ((market-data (unwrap! (map-get? prediction-markets market-id) ERR_MARKET_NOT_FOUND)))
+        
+        ;; Oracle Authorization Check
+        (asserts! (is-eq tx-sender (var-get authorized-oracle-address)) ERR_UNAUTHORIZED)
+        
+        ;; Market Resolution Conditions
+        (asserts! (>= stacks-block-height (get market-end-height market-data)) ERR_MARKET_INACTIVE)
+        (asserts! (not (get is-resolved market-data)) ERR_MARKET_INACTIVE)
+        (asserts! (> final-btc-price u0) ERR_INVALID_PARAMETERS)
+
+        ;; Update Market with Final State
+        (map-set prediction-markets market-id
+            (merge market-data
+                {
+                    final-btc-price: final-btc-price,
+                    is-resolved: true
+                }
+            )
+        )
+        (ok true)
+    )
+)
+
+;; Reward Distribution Function
+;; Calculates and distributes winnings to successful predictors
+(define-public (claim-prediction-rewards (market-id uint))
+    (let ((market-data (unwrap! (map-get? prediction-markets market-id) ERR_MARKET_NOT_FOUND))
+          (participant-data (unwrap! (map-get? participant-predictions 
+                                    { market-id: market-id, participant: tx-sender }) 
+                                    ERR_MARKET_NOT_FOUND)))
+        
+        ;; Resolution & Claim Status Validation
+        (asserts! (get is-resolved market-data) ERR_MARKET_INACTIVE)
+        (asserts! (not (get rewards-claimed participant-data)) ERR_REWARDS_ALREADY_CLAIMED)
+
+        ;; Determine Winning Direction
+        (let ((winning-direction (if (> (get final-btc-price market-data) 
+                                       (get initial-btc-price market-data)) 
+                                   "bullish" "bearish"))
+              (total-market-stakes (+ (get total-bullish-stakes market-data) 
+                                    (get total-bearish-stakes market-data)))
+              (winning-stakes-pool (if (is-eq winning-direction "bullish") 
+                                   (get total-bullish-stakes market-data) 
+                                   (get total-bearish-stakes market-data))))
+            
+            ;; Validate Winning Prediction
+            (asserts! (is-eq (get price-direction participant-data) winning-direction) 
+                     ERR_INVALID_PREDICTION_TYPE)
+            
+            ;; Calculate Proportional Rewards
+            (let ((gross-winnings (/ (* (get staked-amount participant-data) total-market-stakes) 
+                                   winning-stakes-pool))
+                  (platform-fee (/ (* gross-winnings (var-get platform-fee-basis-points)) u10000))
+                  (net-payout (- gross-winnings platform-fee)))
+                
+                ;; Execute Reward Transfers
+                (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender)))
+                (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT_OWNER)))
+                
+                ;; Update Claim Status
+                (map-set participant-predictions 
+                    { market-id: market-id, participant: tx-sender }
+                    (merge participant-data { rewards-claimed: true })
+                )
+                (ok net-payout)
+            )
+        )
+    )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Market Data Retrieval
+(define-read-only (get-market-details (market-id uint))
+    (map-get? prediction-markets market-id)
+)
+
+;; Participant Prediction Retrieval
+(define-read-only (get-participant-prediction (market-id uint) (participant principal))
+    (map-get? participant-predictions { market-id: market-id, participant: participant })
+)
+
+;; Contract Treasury Balance
+(define-read-only (get-protocol-treasury-balance)
+    (stx-get-balance (as-contract tx-sender))
+)
+
+;; Market Statistics
+(define-read-only (get-market-statistics (market-id uint))
+    (match (map-get? prediction-markets market-id)
+        market-data 
+        (some {
+            total-value-locked: (+ (get total-bullish-stakes market-data) 
+                                 (get total-bearish-stakes market-data)),
+            participant-count: (get total-participants market-data),
+            bullish-ratio: (if (> (+ (get total-bullish-stakes market-data) 
+                                   (get total-bearish-stakes market-data)) u0)
+                             (/ (* (get total-bullish-stakes market-data) u100)
+                                (+ (get total-bullish-stakes market-data) 
+                                   (get total-bearish-stakes market-data)))
+                             u50)
+        })
+        none
+    )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Oracle Address Management
+(define-public (update-authorized-oracle (new-oracle-address principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (ok (var-set authorized-oracle-address new-oracle-address))
+    )
+)
+
+;; Minimum Stake Configuration
+(define-public (update-minimum-stake (new-minimum-stake uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-minimum-stake u0) ERR_INVALID_PARAMETERS)
+        (ok (var-set minimum-participation-stake new-minimum-stake))
+    )
+)
+
+;; Platform Fee Configuration
+(define-public (update-platform-fee (new-fee-basis-points uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= new-fee-basis-points u1000) ERR_INVALID_PARAMETERS) ;; Max 10%
+        (ok (var-set platform-fee-basis-points new-fee-basis-points))
+    )
+)
+
+;; Treasury Management
+(define-public (withdraw-protocol-fees (withdrawal-amount uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= withdrawal-amount (stx-get-balance (as-contract tx-sender))) 
+                 ERR_INSUFFICIENT_STAKE_BALANCE)
+        (try! (as-contract (stx-transfer? withdrawal-amount (as-contract tx-sender) CONTRACT_OWNER)))
+        (ok withdrawal-amount)
+    )
+)
